@@ -4,13 +4,14 @@
 Rules of this file:
 - Nothing is faked silently. Missing simulator/LLM fails loudly.
 - Mock backends exist only behind --mock-llm / --mock-sim and every line they print is tagged [MOCK].
+- Round 0 is the default Avellaneda-Stoikov baseline; the model sees it and starts from there.
 - Strategies are chosen on TRAIN seeds and reported on HELD-OUT seeds (no cherry-picking).
-- Baseline (default Avellaneda-Stoikov) and random search with the same budget are always reported.
+- Comparators with the SAME evaluation budget: local hill-climb from baseline, and global random search.
 - Every round is logged to runs/<timestamp>.jsonl.
 
 Simulator backends (--sim):
   python : sim_py.py reference Avellaneda-Stoikov simulator (default; NOT the C++ engine)
-  binary : your C++ engine via -b PATH. Contract: params JSON (+ "seed") on stdin -> metrics JSON on stdout
+  binary : C++ simulator via -b PATH. Contract: params JSON (+ "seed") on stdin -> metrics JSON on stdout
   mock   : random toy numbers, plumbing test only
 """
 import argparse
@@ -34,6 +35,7 @@ SCHEMA = {
 }
 METRIC_KEYS = ["pnl", "sharpe", "max_inventory", "fill_rate", "avg_markout"]
 INT_KEYS = ("inventory_limit", "quote_size")
+PROMPT_NOTE = ""  # extra line appended to the prompt (used when the model repeats an earlier point)
 
 
 def defaults() -> dict:
@@ -52,18 +54,37 @@ def validate(params: dict) -> dict:
 
 
 # ---------- LLM backends ----------
+PARAM_HELP = (
+    "spread_k: multiplier on the quoted half-spread (higher = wider quotes, fewer fills). "
+    "gamma: risk aversion (higher = quotes skew harder against current inventory). "
+    "inventory_limit: max absolute inventory before quoting on one side stops. "
+    "quote_size: units per quote (larger = more risk per fill). "
+    "vol_widen_factor: extra spread multiplier applied when realized volatility spikes."
+)
+
+
 def build_prompt(hypothesis: str, history: list) -> str:
-    """Prompt for the model. Ready for the Meta Model API; no API call happens here."""
+    """Prompt v3: parameter meanings, baseline as round 0, best-so-far anchor, small-step rule."""
     schema = {k: {"min": v[0], "max": v[1], "default": v[2]} for k, v in SCHEMA.items()}
     past = [{"round": h["round"], "params": h["params"], "train_metrics": h["metrics"]} for h in history]
+    best = max(history, key=lambda h: h["metrics"]["sharpe"]) if history else None
+    best_txt = (json.dumps({"round": best["round"], "params": best["params"], "train_metrics": best["metrics"]})
+                if best else "none yet")
     return (
-        "You tune a market-making strategy (Avellaneda-Stoikov style).\n"
+        "You tune a market-making strategy (Avellaneda-Stoikov style) by trial and error.\n"
         f"Trader hypothesis: {hypothesis}\n"
+        f"Parameter meanings: {PARAM_HELP}\n"
         f"Parameter schema (respect bounds): {json.dumps(schema)}\n"
-        f"Previous rounds (higher sharpe and avg_markout is better; max_inventory should stay bounded): {json.dumps(past)}\n"
-        'Reply with ONLY a JSON object: {"params": {...}, "reasoning": "<one or two sentences>", '
-        '"predict_sharpe": "up" or "down" (will sharpe be higher or lower than in the previous round; '
-        'use null in round 1)}'
+        "Round 0 is the default baseline. Rounds so far (higher sharpe and avg_markout is better; "
+        f"max_inventory should stay bounded): {json.dumps(past)}\n"
+        f"Best round so far (highest sharpe): {best_txt}\n"
+        "Rules: change at most two parameters per round, and change them modestly. If the last round made sharpe "
+        "worse than the best round, move back toward the best round's parameters instead of continuing in the same "
+        "direction. Propose a point you have not tried before. Do not claim an improvement that the numbers do "
+        "not support.\n"
+        + (PROMPT_NOTE + "\n" if PROMPT_NOTE else "")
+        + 'Reply with ONLY a JSON object: {"params": {...}, "reasoning": "<one or two sentences>", '
+        '"predict_sharpe": "up" or "down" (will sharpe be higher or lower than in the previous round listed)}'
     )
 
 
@@ -139,10 +160,10 @@ def llm_meta(hypothesis: str, history: list) -> tuple:
 
 def llm_mock(hypothesis: str, history: list) -> tuple:
     print("[MOCK] llm: heuristic proposal, no model called")
-    if not history:
+    if len(history) <= 1:  # only the baseline so far
         p = defaults()
         p.update(vol_widen_factor=2.0, gamma=0.2)
-        return p, "[MOCK] initial guess from hypothesis keywords", None
+        return p, "[MOCK] initial guess from hypothesis keywords", "up"
     last = history[-1]["params"]
     p = dict(last)
     p["spread_k"] = last["spread_k"] * 0.9
@@ -185,10 +206,26 @@ def fmt(m: dict) -> str:
             f"fill_rate={m['fill_rate']:.3f} markout={m['avg_markout']:.3f}")
 
 
+def hill_climb(simulate, binary: str, train: list, seed: int, steps: int, base_sharpe: float) -> dict:
+    """Comparator: local random search from the baseline (same budget as the LLM rounds)."""
+    rng = random.Random(seed + 7)
+    cur, cur_sc = defaults(), base_sharpe
+    for _ in range(steps):
+        cand = dict(cur)
+        for k in rng.sample(list(SCHEMA), 2):
+            cand[k] = cand[k] * rng.uniform(0.8, 1.25)
+        cand = validate(cand)
+        sc = evaluate(simulate, cand, binary, train)["sharpe"]
+        if sc > cur_sc:
+            cur, cur_sc = cand, sc
+    return cur
+
+
 def main():
+    global PROMPT_NOTE
     ap = argparse.ArgumentParser(description="LOB Strategy Lab")
     ap.add_argument("-H", "--hypothesis", required=True)
-    ap.add_argument("-b", "--binary", default="", help="path to C++ engine (selects --sim binary)")
+    ap.add_argument("-b", "--binary", default="", help="path to C++ simulator (selects --sim binary)")
     ap.add_argument("--sim", choices=["python", "binary", "mock"], default="python")
     ap.add_argument("-n", "--rounds", type=int, default=3)
     ap.add_argument("--seed", type=int, default=42)
@@ -214,18 +251,41 @@ def main():
 
     Path("runs").mkdir(exist_ok=True)
     log_path = Path("runs") / f"{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
-    history = []
 
-    for rnd in range(1, args.rounds + 1):
-        raw, reasoning, predicted = propose(args.hypothesis, history)
-        params = validate(raw)
-        metrics = evaluate(simulate, params, args.binary, train)
-        entry = {"round": rnd, "hypothesis": args.hypothesis, "params": params,
-                 "reasoning": reasoning, "predicted_sharpe": predicted, "metrics": metrics, "sim": sim_name}
-        history.append(entry)
+    def log(entry: dict):
         with log_path.open("a") as f:
             f.write(json.dumps(entry) + "\n")
+
+    # Round 0: default baseline, shown to the model as the starting point.
+    base_metrics = evaluate(simulate, defaults(), args.binary, train)
+    base_entry = {"round": 0, "hypothesis": args.hypothesis, "params": defaults(),
+                  "reasoning": "baseline (default A-S parameters)", "predicted_sharpe": None,
+                  "metrics": base_metrics, "sim": sim_name}
+    log(base_entry)
+    print(f"\n== Round 0 (baseline) ==\ntrain    : {fmt(base_metrics)}")
+
+    history = [base_entry]  # what the model sees; includes the baseline
+    for rnd in range(1, args.rounds + 1):
+        PROMPT_NOTE = ""
+        for attempt in range(3):
+            raw, reasoning, predicted = propose(args.hypothesis, history)
+            params = validate(raw)
+            repeat_of = next((h["round"] for h in history if h["params"] == params), None)
+            if repeat_of is None or attempt == 2:
+                break
+            print(f"[llm] repeated the point from round {repeat_of}; asking for a different one")
+            PROMPT_NOTE = (f"Your last proposal was identical to round {repeat_of}. "
+                           "You must propose different parameter values.")
+        PROMPT_NOTE = ""
+        metrics = evaluate(simulate, params, args.binary, train)
+        entry = {"round": rnd, "hypothesis": args.hypothesis, "params": params, "reasoning": reasoning,
+                 "predicted_sharpe": predicted, "repeated": repeat_of is not None,
+                 "metrics": metrics, "sim": sim_name}
+        history.append(entry)
+        log(entry)
         print(f"\n== Round {rnd} ==\nparams   : {json.dumps(params)}\nreasoning: {reasoning}\ntrain    : {fmt(metrics)}")
+
+    llm_rounds = history[1:]
 
     # Calibration: did the model's "sharpe goes up/down" claim match the simulator?
     scored = []
@@ -233,13 +293,16 @@ def main():
         if cur["predicted_sharpe"] is not None and cur["metrics"]["sharpe"] != prev["metrics"]["sharpe"]:
             actual = "up" if cur["metrics"]["sharpe"] > prev["metrics"]["sharpe"] else "down"
             scored.append(cur["predicted_sharpe"] == actual)
+    n_rep = sum(1 for e in llm_rounds if e.get("repeated"))
     if scored:
-        print(f"\n{tag}Calibration: model's sharpe prediction correct {sum(scored)}/{len(scored)} rounds")
+        print(f"\n{tag}Calibration: model's sharpe prediction correct {sum(scored)}/{len(scored)} rounds"
+              f" (repeated points: {n_rep})")
     else:
-        print("\nCalibration: no usable predictions from the model")
+        print(f"\nCalibration: no usable predictions from the model (repeated points: {n_rep})")
 
-    # Fair comparison: same eval budget for random search, pick on train seeds, report on held-out seeds.
-    best_llm = max(history, key=lambda e: e["metrics"]["sharpe"])["params"]
+    # Fair comparison: same evaluation budget for every method; choose on train seeds, report on held-out seeds.
+    best_llm = max(llm_rounds, key=lambda e: e["metrics"]["sharpe"])["params"]
+    hc_best = hill_climb(simulate, args.binary, train, args.seed, args.rounds, base_metrics["sharpe"])
     rng = random.Random(args.seed)
     rand_best, rand_score = None, float("-inf")
     for _ in range(args.rounds):
@@ -249,7 +312,9 @@ def main():
             rand_best, rand_score = cand, sc
 
     print(f"\n{tag}== Held-out comparison ({len(test)} unseen seeds) ==")
-    for name, p in [("LLM-best", best_llm), ("random-search", rand_best), ("baseline A-S", defaults())]:
+    rows = [("LLM-best", best_llm), ("hill-climb", hc_best), ("random-search", rand_best),
+            ("baseline A-S", defaults())]
+    for name, p in rows:
         print(f"{name:14s}: {fmt(evaluate(simulate, p, args.binary, test))}")
     print(f"Log: {log_path}")
 
