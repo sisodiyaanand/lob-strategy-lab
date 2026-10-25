@@ -314,8 +314,12 @@ def main():
     print(f"\n{tag}== Held-out comparison ({len(test)} unseen seeds) ==")
     rows = [("LLM-best", best_llm), ("hill-climb", hc_best), ("random-search", rand_best),
             ("baseline A-S", defaults())]
+    results = {}
     for name, p in rows:
-        print(f"{name:14s}: {fmt(evaluate(simulate, p, args.binary, test))}")
+        m = evaluate(simulate, p, args.binary, test)
+        results[name] = {"params": p, "metrics": m}
+        print(f"{name:14s}: {fmt(m)}")
+    log({"summary": results, "heldout_seeds": len(test), "sim": sim_name, "llm": args.llm})
     print(f"Log: {log_path}")
 
 
